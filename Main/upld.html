@@ -316,6 +316,8 @@
             <a href="home.html">Home</a>
             <a href="progress.html">Track Progress</a>
             <a href="diet&exercise.html">Diet & Exercise</a>
+            <a href="storage.html" aria-label="Storage">Storage</a>
+
         </nav>
 
         <div class="container">
@@ -350,6 +352,7 @@
 
     <script type="module">
 
+        import { supabase } from "./scripts/config.js";
         import { db } from "./scripts/firebase-storage-config.js";
         import { getCurrentUserId } from "./scripts/user-data-service.js";
         import {
@@ -360,7 +363,39 @@
 
 
         document.addEventListener('DOMContentLoaded', function () {
-            let currentAnalysisData = null; // Global variable to store the current analysis
+            let currentAnalysisData = null;
+            let userProfile = null; // To store user profile data
+
+            // Fetch authenticated user profile data
+            async function fetchUserProfile() {
+                try {
+                    const { data: { user }, error } = await supabase.auth.getUser();
+                    if (error) throw error;
+                    if (!user) {
+                        console.error("No authenticated user found");
+                        window.location.href = 'login.html'; // Redirect to login if not authenticated
+                        return null;
+                    }
+                    // Return user metadata (fullName, birthdate, gender, weight, height, medicalInfo, etc.)
+                    return user.user_metadata || {};
+                } catch (error) {
+                    console.error('Error fetching user profile:', error);
+                    return null;
+                }
+            }
+
+            // Initialize the page with user data
+            async function initPage() {
+                userProfile = await fetchUserProfile();
+                if (!userProfile) {
+                    console.warn("User profile not loaded; proceeding with default analysis.");
+                } else {
+                    console.log("User profile loaded:", userProfile);
+                }
+            }
+
+            // Call initPage when the DOM is loaded
+            initPage();
 
             // Set the workerSrc property to load worker from CDN
             pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -501,24 +536,30 @@
             // Function to send PDF directly to Gemini
             async function sendPDFToGemini(file) {
                 try {
-                    // Convert file to base64
                     const base64PDF = await fileToBase64(file);
-
-                    // Extract the base64 data part (remove the prefix)
                     const base64Data = base64PDF.split('base64,')[1];
+                    if (!base64Data) throw new Error('Failed to convert PDF to base64 format');
 
-                    if (!base64Data) {
-                        throw new Error('Failed to convert PDF to base64 format');
-                    }
-
-                    // Gemini API endpoint with your API key
                     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${API_KEY}`;
 
-                    // Construct the prompt with enhanced instructions
-                    const instructions = `
-Analyze this blood test report PDF and provide a detailed, structured analysis following these rules:
+                    // Calculate age from birthdate if available
+                    let age = null;
+                    if (userProfile?.birthdate) {
+                        const birthDate = new Date(userProfile.birthdate);
+                        age = new Date().getFullYear() - birthDate.getFullYear();
+                    }
 
-1. Extract and present patient information first (name, age, sex, ID, etc.) in a structured format. blur out major portion of patient's full name and id for privacy
+                    // Construct personalized prompt
+                    const instructions = `
+Analyze this blood test report PDF and provide a detailed, structured analysis with personalized insights based on the following user profile:
+- Age: ${age || 'Not provided'}
+- Gender: ${userProfile?.gender || 'Not provided'}
+- Weight: ${userProfile?.weight ? `${userProfile.weight} kg` : 'Not provided'}
+- Height: ${userProfile?.height ? `${userProfile.height} cm` : 'Not provided'}
+- Medical History: ${userProfile?.medicalInfo || 'Not provided'}
+
+Follow these rules:
+1. Extract and present patient information first (name, age, sex, ID, etc.) in a structured format. Blur out major portions of the patient's full name and ID for privacy.
 2. Extract test results and present them in a table with these columns:
    - Test Name/Parameter
    - Result (numeric value only, after interpreting units)
@@ -529,8 +570,8 @@ Analyze this blood test report PDF and provide a detailed, structured analysis f
    - Interpret the value by multiplying by 1000 (e.g., "251 x1000/cumm" should be extracted as 251000).
    - Interpret the reference range in the same unit (e.g., "150 - 450" for PLC means 150000 - 450000).
    - Compare the adjusted value to the adjusted range to determine the status.
-4. For each abnormal value (High or Low), provide a brief interpretation (1-2 lines max) in a separate section.
-5. Provide 3-4 key recommendations based on abnormal findings.
+4. For each abnormal value (High or Low), provide a brief interpretation (1-2 lines max) in a separate section, considering the user's age, gender, weight, height, and medical history.
+5. Provide 3-4 personalized recommendations based on abnormal findings and the user profile.
 6. Format your response as HTML - DO NOT include code block markers.
 
 Use this structure and these HTML classes:
@@ -554,7 +595,7 @@ Example table row for Platelet Count (PLC):
   <td class="normal">Normal</td>
 </tr>
 
-IMPORTANT: Be thorough in examining all test values. Pay special attention to:
+IMPORTANT: Adjust reference ranges and interpretations based on the user's age and gender where applicable (e.g., hemoglobin ranges differ for men and women). Be thorough in examining all test values, paying special attention to:
 - Hemoglobin (HB)
 - PCV (Hematocrit)
 - Total Leucocyte Count (TLC)
@@ -567,9 +608,6 @@ IMPORTANT: Be thorough in examining all test values. Pay special attention to:
 ALWAYS include a Status column and ensure the status is determined after interpreting the units correctly.
 `;
 
-                    console.log("Sending request to Gemini API...");
-
-                    // Create request payload with both text instructions and the PDF file
                     const requestBody = {
                         contents: [{
                             parts: [
@@ -590,46 +628,18 @@ ALWAYS include a Status column and ensure the status is determined after interpr
                         }
                     };
 
-                    // Log the request for debugging (without the base64 data for brevity)
-                    console.log("API URL:", apiUrl);
-                    console.log("Request config:", {
-                        ...requestBody,
-                        contents: [{
-                            parts: [
-                                { text: "instructions (omitted for brevity)" },
-                                { inline_data: { mime_type: "application/pdf", data: "base64Data (omitted for brevity)" } }
-                            ]
-                        }]
-                    });
-
-                    // Send the request
                     const response = await fetch(apiUrl, {
                         method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
+                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(requestBody)
                     });
 
-                    // Log the response status and headers for debugging
-                    console.log("Response status:", response.status);
-                    console.log("Response headers:", Object.fromEntries([...response.headers.entries()]));
-
                     if (!response.ok) {
-                        let errorMessage;
-                        try {
-                            const errorData = await response.json();
-                            errorMessage = `API responded with status ${response.status}: ${JSON.stringify(errorData)}`;
-                            console.error("API error response:", errorData);
-                        } catch (e) {
-                            errorMessage = `API responded with status ${response.status}`;
-                        }
-                        throw new Error(errorMessage);
+                        const errorData = await response.json();
+                        throw new Error(`API responded with status ${response.status}: ${JSON.stringify(errorData)}`);
                     }
 
                     const data = await response.json();
-                    console.log("Received response from Gemini API:", data);
-
                     if (!data.candidates || data.candidates.length === 0) {
                         throw new Error('No response generated from Gemini API');
                     }
@@ -637,22 +647,16 @@ ALWAYS include a Status column and ensure the status is determined after interpr
                     let result = "";
                     data.candidates.forEach(candidate => {
                         candidate.content.parts.forEach(part => {
-                            if (part.text) {
-                                result += part.text;
-                            }
+                            if (part.text) result += part.text;
                         });
                     });
 
-                    // Remove any markdown code block markers that might still appear
-                    result = result.replace(/```html/g, '').replace(/```/g, '');
-
-                    return result;
+                    return result.replace(/```html/g, '').replace(/```/g, '');
                 } catch (error) {
                     console.error('Gemini API Error:', error);
                     throw new Error('Failed to analyze with Gemini API: ' + error.message);
                 }
             }
-
             function extractTestValues(rawText, analysisHTML) {
                 let extractedValues = {};
 
@@ -745,7 +749,98 @@ ALWAYS include a Status column and ensure the status is determined after interpr
                         rawText: rawText
                     };
 
-                    // Save to Firestore
+                    // 1. Upload PDF to Supabase storage
+                    let supabaseFileUrl = null;
+                    if (pdfFile.files.length > 0) {
+                        try {
+                            const file = pdfFile.files[0];
+                            const fileExt = file.name.split('.').pop();
+                            const userId = await getCurrentUserId();
+                            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                            const filePath = `${userId}/${timestamp}_${file.name}`;
+
+                            console.log("Uploading file to Supabase storage:", filePath);
+
+                            // Get the current authenticated user
+                            const { data: { user } } = await supabase.auth.getUser();
+
+                            if (!user) {
+                                console.error("No authenticated user found");
+                                throw new Error("Authentication required for file upload");
+                            }
+
+                            // Upload to Supabase Storage 
+                            const { data: uploadData, error: uploadError } = await supabase.storage
+                                .from('blood-reports')
+                                .upload(`public/${filePath}`, file, {
+                                    cacheControl: '3600',
+                                    upsert: true,
+                                    contentType: file.type
+                                });
+
+                            if (uploadError) {
+                                console.error("Supabase storage upload error:", uploadError);
+
+                                // If bucket requires authenticated access for public folder
+                                if (uploadError.statusCode === 400 || uploadError.statusCode === 403) {
+                                    console.log("Attempting upload to authenticated folder...");
+
+                                    // Create folder with user ID if it doesn't exist
+                                    const userFolder = `${user.id}`;
+
+                                    const { data: userUploadData, error: userUploadError } = await supabase.storage
+                                        .from('blood-reports')
+                                        .upload(`${userFolder}/${filePath}`, file, {
+                                            upsert: true,
+                                            contentType: file.type
+                                        });
+
+                                    if (userUploadError) {
+                                        console.error("User folder upload also failed:", userUploadError);
+                                        throw userUploadError;
+                                    } else {
+                                        console.log("File uploaded to user folder successfully:", userUploadData);
+
+                                        // Get the URL - use createSignedUrl for private buckets
+                                        const { data: urlData, error: urlError } = await supabase.storage
+                                            .from('blood-reports')
+                                            .createSignedUrl(`${userFolder}/${filePath}`, 60 * 60 * 24 * 365); // 1 year expiry
+
+                                        if (urlError) {
+                                            console.error("Error creating signed URL:", urlError);
+                                        } else if (urlData) {
+                                            supabaseFileUrl = urlData.signedUrl;
+                                            console.log("Supabase signed file URL:", supabaseFileUrl);
+                                        }
+                                    }
+                                } else {
+                                    throw uploadError;
+                                }
+                            } else {
+                                console.log("File uploaded to public folder successfully:", uploadData);
+
+                                // Get the public URL of the uploaded file
+                                const { data: urlData } = supabase.storage
+                                    .from('blood-reports')
+                                    .getPublicUrl(`public/${filePath}`);
+
+                                if (urlData) {
+                                    supabaseFileUrl = urlData.publicUrl;
+                                    console.log("Supabase public file URL:", supabaseFileUrl);
+                                }
+                            }
+                        } catch (storageError) {
+                            console.error("Error uploading to Supabase storage:", storageError);
+                            // Continue execution even if Supabase upload fails
+                        }
+                    }
+
+                    // Add the Supabase file URL to the report data
+                    if (supabaseFileUrl) {
+                        reportData.pdfUrl = supabaseFileUrl;
+                    }
+
+                    // 2. Save to Firestore (as before)
                     const reportsRef = collection(db, "users", userId, "bloodReports");
                     const docRef = await addDoc(reportsRef, reportData);
 
